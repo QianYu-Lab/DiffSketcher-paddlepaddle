@@ -3,21 +3,18 @@
 # Author: XiMing Xing
 # Description:
 import gc
-from functools import partial
-from typing import Union, List
-from pathlib import Path
 from datetime import datetime, timedelta
-
-from omegaconf import DictConfig
+from functools import partial
+from pathlib import Path
 from pprint import pprint
+from typing import List, Union
+
+import paddle
 import torch
+from accelerate import (Accelerator, DistributedDataParallelKwargs,
+                        GradScalerKwargs, InitProcessGroupKwargs)
 from accelerate.utils import LoggerType
-from accelerate import (
-    Accelerator,
-    GradScalerKwargs,
-    DistributedDataParallelKwargs,
-    InitProcessGroupKwargs
-)
+from omegaconf import DictConfig
 
 from ..modules.ema import EMA
 from ..utils.logging import get_logger
@@ -199,6 +196,10 @@ class ModelState:
     @property
     def device(self):
         return self.accelerator.device
+
+    @property
+    def p_device(self):
+        return "gpu" if paddle.device.is_compiled_with_cuda() else "cpu"
 
     @property
     def weight_dtype(self):

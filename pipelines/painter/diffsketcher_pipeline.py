@@ -3,32 +3,38 @@
 # Author: XiMing Xing
 # Description:
 import pathlib
-from PIL import Image
 from functools import partial
 
+import diffusers
+import numpy as np
+import paddle
+import paddle.nn.functional as F
+import ppdiffusers
 import torch
-import torch.nn.functional as F
+from libs.engine import ModelState
+from libs.metric.clip_score import CLIPScoreWrapper
+from libs.metric.lpips_origin import LPIPS
+from libs.metric.piq.perceptual import DISTS as DISTS_PIQ
+from methods.diffusers_warp import (init_diffusion_pipeline,
+                                    init_diffusion_pipeline_paddle, model2res)
+from methods.diffvg_warp import init_diffvg
+from methods.painter.diffsketcher import (Painter, SketchPainterOptimizer,
+                                          Token2AttnMixinASDSPipeline,
+                                          Token2AttnMixinASDSPipeline_paddle,
+                                          Token2AttnMixinASDSSDXLPipeline)
+from methods.painter.diffsketcher.mask_utils import get_mask_u2net
+from methods.painter.diffsketcher.process_svg import remove_low_opacity_paths
+from methods.painter.diffsketcher.sketch_utils import (fix_image_scale,
+                                                       log_tensor_img,
+                                                       plt_attn, plt_batch,
+                                                       save_tensor_img)
+from methods.token2attn.attn_control import AttentionStore, EmptyControl
+from methods.token2attn.ptp_utils import view_images
+from PIL import Image
+from skimage.color import rgb2gray
 from torchvision import transforms
 from torchvision.datasets.folder import is_image_file
 from tqdm.auto import tqdm
-import numpy as np
-from skimage.color import rgb2gray
-import diffusers
-
-from libs.engine import ModelState
-from libs.metric.lpips_origin import LPIPS
-from libs.metric.piq.perceptual import DISTS as DISTS_PIQ
-from libs.metric.clip_score import CLIPScoreWrapper
-from methods.painter.diffsketcher import (
-    Painter, SketchPainterOptimizer, Token2AttnMixinASDSPipeline, Token2AttnMixinASDSSDXLPipeline)
-from methods.painter.diffsketcher.sketch_utils import (
-    log_tensor_img, plt_batch, plt_attn, save_tensor_img, fix_image_scale)
-from methods.painter.diffsketcher.mask_utils import get_mask_u2net
-from methods.token2attn.attn_control import AttentionStore, EmptyControl
-from methods.token2attn.ptp_utils import view_images
-from methods.diffusers_warp import init_diffusion_pipeline, model2res
-from methods.diffvg_warp import init_diffvg
-from methods.painter.diffsketcher.process_svg import remove_low_opacity_paths
 
 
 class DiffSketcherPipeline(ModelState):
@@ -68,19 +74,29 @@ class DiffSketcherPipeline(ModelState):
             # which causes problem in sds add_noise() function
             # because the random t may not in scheduler.timesteps
             custom_pipeline = Token2AttnMixinASDSSDXLPipeline
-            custom_scheduler = diffusers.DPMSolverMultistepScheduler
+            custom_scheduler = ppdiffusers.DPMSolverMultistepScheduler
             self.args.cross_attn_res = self.args.cross_attn_res * 2
-        elif args.model_id == 'sd21':
-            custom_pipeline = Token2AttnMixinASDSPipeline
-            custom_scheduler = diffusers.DDIMScheduler
-        else:  # sd14, sd15
-            custom_pipeline = Token2AttnMixinASDSPipeline
-            custom_scheduler = diffusers.DDIMScheduler
+        else:  # sd14, sd15, sd21
+            custom_pipeline = Token2AttnMixinASDSPipeline_paddle
+            custom_scheduler = ppdiffusers.DDIMScheduler
 
-        self.diffusion = init_diffusion_pipeline(
+        self.diffusion = init_diffusion_pipeline_paddle(
             self.args.model_id,
             custom_pipeline=custom_pipeline,
             custom_scheduler=custom_scheduler,
+            device=self.p_device,
+            local_files_only=not args.download,
+            force_download=args.force_download,
+            resume_download=args.resume_download,
+            ldm_speed_up=args.ldm_speed_up,
+            enable_xformers=args.enable_xformers,
+            gradient_checkpoint=args.gradient_checkpoint,
+        )
+
+        self.sds_diffusion = init_diffusion_pipeline(
+            self.args.model_id,
+            custom_pipeline=Token2AttnMixinASDSPipeline,
+            custom_scheduler=diffusers.DDIMScheduler,
             device=self.device,
             local_files_only=not args.download,
             force_download=args.force_download,
@@ -91,6 +107,7 @@ class DiffSketcherPipeline(ModelState):
         )
 
         self.g_device = torch.Generator(device=self.device).manual_seed(args.seed)
+        paddle.set_device(self.p_device)
 
         # init clip model and clip score wrapper
         self.cargs = self.args.clip
@@ -123,8 +140,7 @@ class DiffSketcherPipeline(ModelState):
                                  width=width,
                                  controller=controller,
                                  num_inference_steps=self.args.num_inference_steps,
-                                 guidance_scale=self.args.guidance_scale,
-                                 generator=self.g_device)
+                                 guidance_scale=self.args.guidance_scale)
 
         target_file = self.results_path / "ldm_generated_image.png"
         view_images([np.array(img) for img in outputs.images], save_image=True, fp=target_file)
@@ -146,12 +162,15 @@ class DiffSketcherPipeline(ModelState):
             self.print(f"select cross_attn_map shape: {cross_attn_map.shape}\n")
             cross_attn_map = 255 * cross_attn_map / cross_attn_map.max()
             # [res, res, 3]
-            cross_attn_map = cross_attn_map.unsqueeze(-1).expand(*cross_attn_map.shape, 3)
+            # cross_attn_map = cross_attn_map.unsqueeze(-1).expand(*cross_attn_map.shape, 3)
+            cross_attn_map = paddle.unsqueeze(cross_attn_map, axis=-1)
+            cross_attn_map = paddle.expand(cross_attn_map, shape=[*cross_attn_map.shape[:-1], 3])
+            self.print(f"expand cross_attn_map shape: {cross_attn_map.shape}")
             # [3, res, res]
             cross_attn_map = cross_attn_map.permute(2, 0, 1).unsqueeze(0)
             # [3, clip_size, clip_size]
-            cross_attn_map = F.interpolate(cross_attn_map, size=self.args.image_size, mode='bicubic')
-            cross_attn_map = torch.clamp(cross_attn_map, min=0, max=255)
+            cross_attn_map = F.interpolate(cross_attn_map, size=[self.args.image_size, self.args.image_size], mode='bicubic')
+            cross_attn_map = paddle.clip(cross_attn_map, min=0, max=255)
             # rgb to gray
             cross_attn_map = rgb2gray(cross_attn_map.squeeze(0).permute(1, 2, 0)).astype(np.float32)
             # torch to numpy
@@ -307,7 +326,7 @@ class DiffSketcherPipeline(ModelState):
                 sds_loss, grad = torch.tensor(0), torch.tensor(0)
                 if self.step >= self.args.sds.warmup:
                     grad_scale = self.args.sds.grad_scale if self.step > self.args.sds.warmup else 0
-                    sds_loss, grad = self.diffusion.score_distillation_sampling(
+                    sds_loss, grad = self.sds_diffusion.score_distillation_sampling(
                         raster_sketch,
                         crop_size=self.args.sds.crop_size,
                         augments=self.args.sds.augmentations,

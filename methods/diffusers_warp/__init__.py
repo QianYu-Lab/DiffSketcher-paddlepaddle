@@ -2,14 +2,21 @@
 # Copyright (c) XiMing Xing. All rights reserved.
 # Author: XiMing Xing
 # Description:
-from typing import AnyStr
 import pathlib
 from collections import OrderedDict
-from packaging import version
+from typing import AnyStr
 
+import paddle
 import torch
-from diffusers import StableDiffusionPipeline, SchedulerMixin, DiffusionPipeline
+from diffusers import (DiffusionPipeline, SchedulerMixin,
+                       StableDiffusionPipeline)
 from diffusers.utils import is_torch_version, is_xformers_available
+from packaging import version
+from ppdiffusers import SchedulerMixin as SchedulerMixin_paddle
+from ppdiffusers import \
+    StableDiffusionPipeline as StableDiffusionPipeline_paddle
+from ppdiffusers import UNet2DConditionModel
+from ppdiffusers.utils import is_ppxformers_available
 
 huggingface_model_dict = OrderedDict({
     "sd14": "CompVis/stable-diffusion-v1-4",  # resolution: 512
@@ -124,6 +131,95 @@ def init_diffusion_pipeline(model_id: AnyStr,
             pipeline.unet.enable_xformers_memory_efficient_attention()
         else:
             print(f"=> warning: calling xformers failed")
+
+    # gradient checkpointing
+    if gradient_checkpoint:
+        try:
+            print(f"=> enable gradient checkpointing")
+            pipeline.unet.enable_gradient_checkpointing()
+        except Exception as e:
+            print("=> waring: gradient checkpointing is not activated for this model.")
+
+    print(f"Diffusion Model: {model_id}")
+    print(pipeline.scheduler)
+    return pipeline
+
+
+def init_diffusion_pipeline_paddle(model_id: AnyStr,
+                                   custom_pipeline: StableDiffusionPipeline_paddle,
+                                   custom_scheduler: SchedulerMixin_paddle = None,
+                                   device: str = "cuda",
+                                   torch_dtype: torch.dtype = paddle.float32,
+                                   local_files_only: bool = True,
+                                   force_download: bool = False,
+                                   resume_download: bool = False,
+                                   ldm_speed_up: bool = False,
+                                   enable_xformers: bool = True,
+                                   gradient_checkpoint: bool = False,
+                                   lora_path: AnyStr = None,
+                                   unet_path: AnyStr = None) -> StableDiffusionPipeline_paddle:
+    """
+    A tool for initial diffusers model.
+
+    Args:
+        model_id (`str` or `os.PathLike`, *optional*): pretrained_model_name_or_path
+        custom_pipeline: any StableDiffusionPipeline pipeline
+        custom_scheduler: any scheduler
+        device: set device
+        local_files_only: prohibited download model
+        force_download: forced download model
+        resume_download: re-download model
+        ldm_speed_up: use the `torch.compile` api to speed up unet
+        enable_xformers: enable memory efficient attention from [xFormers]
+        gradient_checkpoint: activates gradient checkpointing for the current model
+        lora_path: load LoRA checkpoint
+        unet_path: load unet checkpoint
+
+    Returns:
+            ppdiffusers.StableDiffusionPipeline
+    """
+
+    # get model id
+    model_id = huggingface_model_dict.get(model_id, model_id)
+
+    # process diffusion model
+    if custom_scheduler is not None:
+        pipeline = custom_pipeline.from_pretrained(
+            model_id,
+            torch_dtype=torch_dtype,
+            local_files_only=local_files_only,
+            force_download=force_download,
+            resume_download=resume_download,
+            scheduler=custom_scheduler.from_pretrained(model_id,
+                                                       subfolder="scheduler",
+                                                       local_files_only=local_files_only)
+        ).to(device)
+    else:
+        pipeline = custom_pipeline.from_pretrained(
+            model_id,
+            torch_dtype=torch_dtype,
+            local_files_only=local_files_only,
+            force_download=force_download,
+            resume_download=resume_download,
+        ).to(device)
+
+    # process unet model if exist
+    if unet_path is not None and pathlib.Path(unet_path).exists():
+        print(f"=> load u-net from {unet_path}")
+        pipeline.unet.from_pretrained(model_id, subfolder="unet")
+
+    # process lora layers if exist
+    if lora_path is not None and pathlib.Path(lora_path).exists():
+        pipeline.unet.load_attn_procs(lora_path)
+        print(f"=> load lora layers into U-Net from {lora_path} ...")
+
+    # Meta xformers
+    if enable_xformers:
+        if is_ppxformers_available():
+            print(f"=> enable xformers")
+            pipeline.unet.enable_xformers_memory_efficient_attention()
+        else:
+            print(f"=> warning: xformers is not available.")
 
     # gradient checkpointing
     if gradient_checkpoint:
